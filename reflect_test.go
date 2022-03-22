@@ -473,3 +473,22 @@ func TestSplitOnUnescapedCommas(t *testing.T) {
 		require.Equal(t, test.expected, actual)
 	}
 }
+
+type EmbedStruct struct {
+	Field0 struct {
+		Field1 string
+		Field2 struct {
+			Field3 string
+		}
+	}
+	Field4 struct {
+		Field5 string
+		Field6 int64
+	}
+}
+
+func TestReflectEmbedStruct(t *testing.T) {
+	sch := Reflect(EmbedStruct{})
+	o, _ := sch.MarshalJSONWithOptions(DisableBooleanJSONSchemas())
+	t.Logf("AAA: %s\n", string(o))
+}

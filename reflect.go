@@ -9,6 +9,7 @@ package jsonschema
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"reflect"
@@ -100,6 +101,19 @@ var (
 	// FalseSchema defines a schema with a false value
 	FalseSchema = &Schema{boolean: &[]bool{false}[0]}
 )
+
+type MarshalOption func(*MarshalConfig)
+
+func DisableBooleanJSONSchemas() MarshalOption {
+	return func(cfg *MarshalConfig) {
+		cfg.DisableBooleanJSONSchemas = true
+	}
+}
+
+type MarshalConfig struct {
+	// Disable 4.3.2.Boolean JSON Schemas
+	DisableBooleanJSONSchemas bool
+}
 
 // customSchemaImpl is used to detect if the type provides it's own
 // custom Schema Type definition to use instead. Very useful for situations
@@ -239,13 +253,13 @@ func (r *Reflector) ReflectFromType(t reflect.Type) *Schema {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem() // re-assign from pointer
 	}
-
-	name := r.typeName(t)
+	ctx := newReflectContext()
+	name := r.typeName(ctx, t)
 
 	s := new(Schema)
 	definitions := Definitions{}
 	s.Definitions = definitions
-	bs := r.reflectTypeToSchemaWithID(definitions, t)
+	bs := r.reflectTypeToSchemaWithID(ctx, definitions, t)
 	if r.ExpandedStruct {
 		*s = *definitions[name]
 		delete(definitions, name)
@@ -308,7 +322,38 @@ func (r *Reflector) SetBaseSchemaID(id string) {
 	r.BaseSchemaID = ID(id)
 }
 
-func (r *Reflector) refOrReflectTypeToSchema(definitions Definitions, t reflect.Type) *Schema {
+type ReflectContext interface {
+	TypeName(reflect.Type) string
+	MarkAnonymousTypeField(f reflect.StructField, parent reflect.Type)
+}
+
+type reflectContext struct {
+	anonymousTypeName map[reflect.Type]string
+}
+
+func newReflectContext() *reflectContext {
+	return &reflectContext{
+		anonymousTypeName: map[reflect.Type]string{},
+	}
+}
+
+func (ctx *reflectContext) TypeName(t reflect.Type) string {
+	if name := t.Name(); name != "" {
+		return name
+	}
+	name, ok := ctx.anonymousTypeName[t]
+	if ok {
+		return name
+	}
+	return ""
+}
+
+func (ctx *reflectContext) MarkAnonymousTypeField(f reflect.StructField, parent reflect.Type) {
+	name := fmt.Sprintf("%s.%s", ctx.TypeName(parent), f.Name)
+	ctx.anonymousTypeName[f.Type] = name
+}
+
+func (r *Reflector) refOrReflectTypeToSchema(ctx ReflectContext, definitions Definitions, t reflect.Type) *Schema {
 	id := r.lookupID(t)
 	if id != EmptyID {
 		return &Schema{
@@ -317,15 +362,15 @@ func (r *Reflector) refOrReflectTypeToSchema(definitions Definitions, t reflect.
 	}
 
 	// Already added to definitions?
-	if _, ok := definitions[r.typeName(t)]; ok && !r.DoNotReference {
-		return r.refDefinition(definitions, t)
+	if _, ok := definitions[r.typeName(ctx, t)]; ok && !r.DoNotReference {
+		return r.refDefinition(ctx, definitions, t)
 	}
 
-	return r.reflectTypeToSchemaWithID(definitions, t)
+	return r.reflectTypeToSchemaWithID(ctx, definitions, t)
 }
 
-func (r *Reflector) reflectTypeToSchemaWithID(defs Definitions, t reflect.Type) *Schema {
-	s := r.reflectTypeToSchema(defs, t)
+func (r *Reflector) reflectTypeToSchemaWithID(ctx ReflectContext, defs Definitions, t reflect.Type) *Schema {
+	s := r.reflectTypeToSchema(ctx, defs, t)
 	if s != nil {
 		if r.Lookup != nil {
 			id := r.Lookup(t)
@@ -337,14 +382,14 @@ func (r *Reflector) reflectTypeToSchemaWithID(defs Definitions, t reflect.Type) 
 	return s
 }
 
-func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type) *Schema {
+func (r *Reflector) reflectTypeToSchema(ctx ReflectContext, definitions Definitions, t reflect.Type) *Schema {
 	if r.Mapper != nil {
 		if t := r.Mapper(t); t != nil {
 			return t
 		}
 	}
 
-	if rt := r.reflectCustomSchema(definitions, t); rt != nil {
+	if rt := r.reflectCustomSchema(ctx, definitions, t); rt != nil {
 		return rt
 	}
 
@@ -373,7 +418,7 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 		case uriType: // uri RFC section 7.3.6
 			return &Schema{Type: "string", Format: "uri"}
 		default:
-			return r.reflectOrRefStruct(definitions, t)
+			return r.reflectOrRefStruct(ctx, definitions, t)
 		}
 
 	case reflect.Map:
@@ -382,7 +427,7 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 			rt := &Schema{
 				Type: "object",
 				PatternProperties: map[string]*Schema{
-					"^[0-9]+$": r.refOrReflectTypeToSchema(definitions, t.Elem()),
+					"^[0-9]+$": r.refOrReflectTypeToSchema(ctx, definitions, t.Elem()),
 				},
 				AdditionalProperties: FalseSchema,
 			}
@@ -398,7 +443,7 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 			rt = &Schema{
 				Type: "object",
 				PatternProperties: map[string]*Schema{
-					".*": r.refOrReflectTypeToSchema(definitions, t.Elem()),
+					".*": r.refOrReflectTypeToSchema(ctx, definitions, t.Elem()),
 				},
 			}
 		}
@@ -420,7 +465,7 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 			return returnType
 		}
 		returnType.Type = "array"
-		returnType.Items = r.refOrReflectTypeToSchema(definitions, t.Elem())
+		returnType.Items = r.refOrReflectTypeToSchema(ctx, definitions, t.Elem())
 		return returnType
 
 	case reflect.Interface:
@@ -440,44 +485,44 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 		return &Schema{Type: "string"}
 
 	case reflect.Ptr:
-		return r.refOrReflectTypeToSchema(definitions, t.Elem())
+		return r.refOrReflectTypeToSchema(ctx, definitions, t.Elem())
 	}
 	panic("unsupported type " + t.String())
 }
 
-func (r *Reflector) reflectCustomSchema(definitions Definitions, t reflect.Type) *Schema {
+func (r *Reflector) reflectCustomSchema(ctx ReflectContext, definitions Definitions, t reflect.Type) *Schema {
 	if t.Kind() == reflect.Ptr {
-		return r.reflectCustomSchema(definitions, t.Elem())
+		return r.reflectCustomSchema(ctx, definitions, t.Elem())
 	}
 
 	if t.Implements(customType) {
 		v := reflect.New(t)
 		o := v.Interface().(customSchemaImpl)
 		st := o.JSONSchema()
-		r.addDefinition(definitions, t, st)
+		r.addDefinition(ctx, definitions, t, st)
 		if r.DoNotReference {
 			return st
 		} else {
-			return r.refDefinition(definitions, t)
+			return r.refDefinition(ctx, definitions, t)
 		}
 	}
 
 	return nil
 }
 
-func (r *Reflector) reflectOrRefStruct(definitions Definitions, t reflect.Type) *Schema {
+func (r *Reflector) reflectOrRefStruct(ctx ReflectContext, definitions Definitions, t reflect.Type) *Schema {
 	st := new(Schema)
-	r.addDefinition(definitions, t, st) // makes sure we have a re-usable reference already
-	r.reflectStruct(definitions, t, st)
+	r.addDefinition(ctx, definitions, t, st) // makes sure we have a re-usable reference already
+	r.reflectStruct(ctx, definitions, t, st)
 	if r.DoNotReference {
 		return st
 	} else {
-		return r.refDefinition(definitions, t)
+		return r.refDefinition(ctx, definitions, t)
 	}
 }
 
 // Reflects a struct to a JSON Schema type.
-func (r *Reflector) reflectStruct(definitions Definitions, t reflect.Type, s *Schema) {
+func (r *Reflector) reflectStruct(ctx ReflectContext, definitions Definitions, t reflect.Type, s *Schema) {
 	s.Type = "object"
 	s.Properties = orderedmap.New()
 	s.Description = r.lookupComment(t, "")
@@ -496,11 +541,11 @@ func (r *Reflector) reflectStruct(definitions Definitions, t reflect.Type, s *Sc
 		}
 	}
 	if !ignored {
-		r.reflectStructFields(s, definitions, t)
+		r.reflectStructFields(ctx, s, definitions, t)
 	}
 }
 
-func (r *Reflector) reflectStructFields(st *Schema, definitions Definitions, t reflect.Type) {
+func (r *Reflector) reflectStructFields(ctx ReflectContext, st *Schema, definitions Definitions, t reflect.Type) {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
@@ -515,18 +560,22 @@ func (r *Reflector) reflectStructFields(st *Schema, definitions Definitions, t r
 		getFieldDocString = o.GetFieldDocString
 	}
 
-	handleField := func(f reflect.StructField) {
+	handleField := func(f reflect.StructField, parent reflect.Type) {
 		name, shouldEmbed, required, nullable := r.reflectFieldName(f)
 		// if anonymous and exported type should be processed recursively
 		// current type should inherit properties of anonymous one
 		if name == "" {
 			if shouldEmbed {
-				r.reflectStructFields(st, definitions, f.Type)
+				r.reflectStructFields(ctx, st, definitions, f.Type)
 			}
 			return
 		}
 
-		property := r.refOrReflectTypeToSchema(definitions, f.Type)
+		if f.IsExported() && f.Type.Name() == "" {
+			ctx.MarkAnonymousTypeField(f, t)
+		}
+
+		property := r.refOrReflectTypeToSchema(ctx, definitions, f.Type)
 		property.structKeywordsFromTags(f, st, name)
 		if property.Description == "" {
 			property.Description = r.lookupComment(t, f.Name)
@@ -554,12 +603,12 @@ func (r *Reflector) reflectStructFields(st *Schema, definitions Definitions, t r
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		handleField(f)
+		handleField(f, t)
 	}
 	if r.AdditionalFields != nil {
 		if af := r.AdditionalFields(t); af != nil {
 			for _, sf := range af {
-				handleField(sf)
+				handleField(sf, t)
 			}
 		}
 	}
@@ -579,14 +628,14 @@ func (r *Reflector) lookupComment(t reflect.Type, name string) string {
 }
 
 // addDefinition will append the provided schema. If needed, an ID and anchor will also be added.
-func (r *Reflector) addDefinition(definitions Definitions, t reflect.Type, s *Schema) {
-	name := r.typeName(t)
+func (r *Reflector) addDefinition(ctx ReflectContext, definitions Definitions, t reflect.Type, s *Schema) {
+	name := r.typeName(ctx, t)
 	definitions[name] = s
 }
 
 // refDefinition will provide a schema with a reference to an existing definition.
-func (r *Reflector) refDefinition(_ Definitions, t reflect.Type) *Schema {
-	name := r.typeName(t)
+func (r *Reflector) refDefinition(ctx ReflectContext, _ Definitions, t reflect.Type) *Schema {
+	name := r.typeName(ctx, t)
 	return &Schema{
 		Ref: "#/$defs/" + name,
 	}
@@ -969,16 +1018,30 @@ func (t *Schema) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, aux)
 }
 
-func (t *Schema) MarshalJSON() ([]byte, error) {
+func (t *Schema) MarshalJSONWithOptions(opts ...MarshalOption) ([]byte, error) {
+	cfg := &MarshalConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
 	if t.boolean != nil {
 		if *t.boolean {
+			if cfg.DisableBooleanJSONSchemas {
+				return []byte("{}"), nil
+			}
 			return []byte("true"), nil
 		} else {
+			if cfg.DisableBooleanJSONSchemas {
+				return []byte(`{"not":{}}`), nil
+			}
 			return []byte("false"), nil
 		}
 	}
 	if reflect.DeepEqual(&Schema{}, t) {
 		// Don't bother returning empty schemas
+		if cfg.DisableBooleanJSONSchemas {
+			return []byte("{}"), nil
+		}
 		return []byte("true"), nil
 	}
 	type Schema_ Schema
@@ -1000,11 +1063,14 @@ func (t *Schema) MarshalJSON() ([]byte, error) {
 	return append(b, m[1:]...), nil
 }
 
-func (r *Reflector) typeName(t reflect.Type) string {
+func (r *Reflector) typeName(ctx ReflectContext, t reflect.Type) string {
 	if r.Namer != nil {
 		if name := r.Namer(t); name != "" {
 			return name
 		}
+	}
+	if name := ctx.TypeName(t); name != "" {
+		return name
 	}
 	return t.Name()
 }
