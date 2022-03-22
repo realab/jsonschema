@@ -241,6 +241,13 @@ type Reflector struct {
 	//
 	// See also: AddGoComments
 	CommentMap map[string]string
+
+	// Use package paths as well as type names, to avoid conflicts.
+	// Without this setting, if two packages contain a type with the same name,
+	// and both are present in a schema, they will conflict and overwrite in
+	// the definition map and produce bad output.  This is particularly
+	// noticeable when using DoNotReference.
+	FullyQualifyTypeNames bool
 }
 
 // Reflect reflects to Schema from a value.
@@ -253,7 +260,7 @@ func (r *Reflector) ReflectFromType(t reflect.Type) *Schema {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem() // re-assign from pointer
 	}
-	ctx := newReflectContext()
+	ctx := WithReflector(r)
 	name := r.typeName(ctx, t)
 
 	s := new(Schema)
@@ -323,34 +330,51 @@ func (r *Reflector) SetBaseSchemaID(id string) {
 }
 
 type ReflectContext interface {
-	TypeName(reflect.Type) string
+	AnonymousTypeName(reflect.Type) string
 	MarkAnonymousTypeField(f reflect.StructField, parent reflect.Type)
 }
 
+func WithReflector(r *Reflector) ReflectContext {
+	ctx := newReflectContext()
+	ctx.reflector = r
+	return ctx
+}
+
+type anonymousNamedField struct {
+	field  *reflect.StructField
+	parent *reflect.Type
+}
+
 type reflectContext struct {
-	anonymousTypeName map[reflect.Type]string
+	reflector            *Reflector
+	anonymousTypeAtField map[reflect.Type]*anonymousNamedField
 }
 
 func newReflectContext() *reflectContext {
 	return &reflectContext{
-		anonymousTypeName: map[reflect.Type]string{},
+		anonymousTypeAtField: map[reflect.Type]*anonymousNamedField{},
 	}
 }
 
-func (ctx *reflectContext) TypeName(t reflect.Type) string {
+func (ctx *reflectContext) AnonymousTypeName(t reflect.Type) string {
 	if name := t.Name(); name != "" {
-		return name
+		if ctx.reflector.FullyQualifyTypeNames {
+			name = fmt.Sprintf("%s.%s", t.PkgPath(), name)
+			return name
+		}
 	}
-	name, ok := ctx.anonymousTypeName[t]
+	f, ok := ctx.anonymousTypeAtField[t]
 	if ok {
-		return name
+		return fmt.Sprintf("%s.%s", ctx.AnonymousTypeName(*f.parent), f.field.Name)
 	}
 	return ""
 }
 
 func (ctx *reflectContext) MarkAnonymousTypeField(f reflect.StructField, parent reflect.Type) {
-	name := fmt.Sprintf("%s.%s", ctx.TypeName(parent), f.Name)
-	ctx.anonymousTypeName[f.Type] = name
+	ctx.anonymousTypeAtField[f.Type] = &anonymousNamedField{
+		field:  &f,
+		parent: &parent,
+	}
 }
 
 func (r *Reflector) refOrReflectTypeToSchema(ctx ReflectContext, definitions Definitions, t reflect.Type) *Schema {
@@ -1069,10 +1093,14 @@ func (r *Reflector) typeName(ctx ReflectContext, t reflect.Type) string {
 			return name
 		}
 	}
-	if name := ctx.TypeName(t); name != "" {
-		return name
+	name := t.Name()
+	if name == "" {
+		return ctx.AnonymousTypeName(t)
 	}
-	return t.Name()
+	if r.FullyQualifyTypeNames {
+		return t.PkgPath() + "." + name
+	}
+	return name
 }
 
 // Split on commas that are not preceded by `\`.

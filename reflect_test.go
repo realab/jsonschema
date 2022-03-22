@@ -488,7 +488,11 @@ type EmbedStruct struct {
 }
 
 func TestReflectEmbedStruct(t *testing.T) {
-	sch := Reflect(EmbedStruct{})
+	r := Reflector{
+		Anonymous:             true,
+		FullyQualifyTypeNames: true,
+	}
+	sch := r.Reflect(EmbedStruct{})
 	o, _ := sch.MarshalJSONWithOptions(DisableBooleanJSONSchemas())
 	t.Logf("AAA: %s\n", string(o))
 }
